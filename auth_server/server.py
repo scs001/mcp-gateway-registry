@@ -8515,6 +8515,12 @@ async def mcp_proxy(
     # INSUFFICIENT_BALANCE on an exhausted account and 503
     # BILLING_UNAVAILABLE when the billing plane is unreachable under
     # PREFLIGHT_MODE=strict (postpaid mode degrades to allow + audit).
+    # wire-self-serve-launch 3.2: with FD_WIRE_QUOTA_GATE=on the module first
+    # runs the monthly line-quota gate against the wire api (402
+    # MONTHLY_QUOTA_EXHAUSTED when the month's included lines are spent; 503
+    # QUOTA_UNAVAILABLE fail-closed; admin callers exempt) and its
+    # enforce_balance flag conditions the balance probe below (false skips
+    # it, so free-tier 0 balances pass). Default off == old behavior only.
     # Flat import first: Dockerfile.auth copies auth_server/ into /app
     # flattened, so the sibling module only resolves by its flat name in the
     # container (see tests/unit/test_auth_server_flat_imports.py); the
