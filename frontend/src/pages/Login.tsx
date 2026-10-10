@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { ExclamationTriangleIcon } from '@heroicons/react/24/outline';
 import LanguageSwitcher from '../components/LanguageSwitcher';
+import BrandMark from '../components/BrandMark';
 import { useI18n } from '../contexts/I18nContext';
 import { useUiTitle } from '../hooks/useUiTitle';
 import { isSafeUrl } from '../utils/safeUrl';
@@ -89,11 +90,14 @@ const Login: React.FC = () => {
         <LanguageSwitcher />
       </div>
       <div className="sm:mx-auto sm:w-full sm:max-w-md">
-        <h2 className="text-center text-3xl font-bold text-gray-900 dark:text-white">
+        <div className="flex justify-center">
+          <BrandMark size="lg" />
+        </div>
+        <h2 className="mt-5 text-center text-3xl font-bold text-gray-900 dark:text-white">
           {t('Sign in to {title}', { title: t(uiTitle) })}
         </h2>
         <p className="mt-2 text-center text-sm text-gray-600 dark:text-gray-400">
-          {t('Access your AI management dashboard')}
+          {t('Packs management platform by FindData Technology')}
         </p>
       </div>
 
