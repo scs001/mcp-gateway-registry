@@ -1685,3 +1685,344 @@ class TestMcpProxyQuotaGateRoute:
             response = self._post(client)
         assert response.status_code == 200
         assert _probe_urls(probe_client) == ["https://sub2api.example/v1/models"]
+
+
+# ---------------------------------------------------------------------------
+# Gate jurisdiction scoping (fix-quota-gate-server-scope)
+# ---------------------------------------------------------------------------
+
+
+class TestWireQuotaGateScope:
+    """FD_WIRE_QUOTA_SERVERS opt-in jurisdiction: unset gates every server
+    (legacy behavior kept for gray-release and wire free-tier semantics);
+    set -> only the listed registered servers are gated and everything else
+    skips the line gate entirely, keeping ordinary balance semantics."""
+
+    def test_unset_scope_keeps_legacy_gate_everywhere(self, monkeypatch):
+        import asyncio
+
+        from fastapi import HTTPException
+
+        import auth_server.preflight_quota as pq
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS=None)
+        probe_client, patcher = _patch_probe_client(_quota_response(0))
+        with patcher, pytest.raises(HTTPException) as exc:
+            asyncio.run(pq.enforce_mcp_proxy_preflight(_claims(), "lex-srv/mcp"))
+        assert exc.value.detail["error"] == "MONTHLY_QUOTA_EXHAUSTED"
+        assert _probe_urls(probe_client) == [_WIRE_QUOTA_URL]
+
+    def test_out_of_scope_server_skips_line_gate_line_probe_never_runs(self, monkeypatch):
+        """The lex incident, regression-pinned: a mapped non-wire caller on an
+        unlisted server must never be probed against the wire quota plane (a
+        wire-side 404 "no such customer" is that line's NORMAL state, not a
+        fail-closable misconfiguration)."""
+        import asyncio
+
+        import auth_server.preflight_quota as pq
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="wire-srv, other-wire")
+        probe_client, patcher = _patch_probe_client(
+            _probe_response(200, {"code": 0, "data": {"balance": 100, "status": "active"}})
+        )
+        with patcher:
+            asyncio.run(
+                pq.enforce_mcp_proxy_preflight(_claims(), "fd-legal-search-mcp/mcp")
+            )
+        # Balance probe only — the wire quota URL is absent.
+        assert _probe_urls(probe_client) == [_SUB2API_USER_URL]
+
+    def test_out_of_scope_server_balance_gate_still_refuses(self, monkeypatch):
+        """Scope exemption is NOT a billing bypass: the exempted caller keeps
+        the ordinary balance semantics (0 balance -> 402 INSUFFICIENT_BALANCE)."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        import auth_server.preflight_quota as pq
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="wire-srv")
+        probe_client, patcher = _patch_probe_client(
+            _probe_response(200, {"code": 0, "data": {"balance": 0, "status": "active"}})
+        )
+        with patcher, pytest.raises(HTTPException) as exc:
+            asyncio.run(pq.enforce_mcp_proxy_preflight(_claims(), "lex-srv/mcp"))
+        assert exc.value.detail["error"] == "INSUFFICIENT_BALANCE"
+        assert _probe_urls(probe_client) == [_SUB2API_USER_URL]
+
+    def test_in_scope_server_gated_despite_transport_suffix(self, monkeypatch):
+        import asyncio
+
+        from fastapi import HTTPException
+
+        import auth_server.preflight_quota as pq
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="wire-srv")
+        probe_client, patcher = _patch_probe_client(_quota_response(0))
+        with patcher, pytest.raises(HTTPException) as exc:
+            asyncio.run(pq.enforce_mcp_proxy_preflight(_claims(), "wire-srv/mcp"))
+        assert exc.value.detail["error"] == "MONTHLY_QUOTA_EXHAUSTED"
+        assert _probe_urls(probe_client) == [_WIRE_QUOTA_URL]
+
+    def test_scope_list_entries_normalized_and_case_insensitive(self, monkeypatch):
+        """Ops-facing forgiveness: list entries may carry the transport suffix
+        and mixed case; the registered-name normalization applies to both
+        sides of the comparison."""
+        import asyncio
+
+        import auth_server.preflight_quota as pq
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="Wire-Srv/mcp, ,")
+        probe_client, patcher = _patch_probe_client(_quota_response(0))
+        with patcher, pytest.raises(Exception):
+            asyncio.run(pq.enforce_mcp_proxy_preflight(_claims(), "wire-srv/sse"))
+        assert _probe_urls(probe_client) == [_WIRE_QUOTA_URL]
+
+    def test_federated_key_scoped_intact(self, monkeypatch):
+        """Federated ``peer/server`` keys stay intact: only the trailing
+        transport segment is stripped, so a federated wire server is gated by
+        its full key while a sibling backend under the same peer is exempt."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        import auth_server.preflight_quota as pq
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="peer-1/wire-srv")
+        probe_client, patcher = _patch_probe_client(
+            _probe_response(200, {"code": 0, "data": {"balance": 100, "status": "active"}})
+        )
+        with patcher:
+            # Exempt sibling first: balance probe only.
+            asyncio.run(pq.enforce_mcp_proxy_preflight(_claims(), "peer-1/other-srv/mcp"))
+        assert _probe_urls(probe_client) == [_SUB2API_USER_URL]
+
+        pq._cache.clear()
+        probe_client2, patcher2 = _patch_probe_client(_quota_response(0))
+        with patcher2, pytest.raises(HTTPException) as exc:
+            asyncio.run(pq.enforce_mcp_proxy_preflight(_claims(), "peer-1/wire-srv/mcp"))
+        assert exc.value.detail["error"] == "MONTHLY_QUOTA_EXHAUSTED"
+
+    def test_in_scope_unavailable_fail_closed_doctrine_unchanged(self, monkeypatch):
+        """Within jurisdiction the fail-closed doctrine is untouched: a wire
+        404 for an in-scope server is a real misconfiguration and refuses."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        import auth_server.preflight_quota as pq
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="wire-srv")
+        probe_client, patcher = _patch_probe_client(_probe_response(404, {"detail": "x"}))
+        with patcher, pytest.raises(HTTPException) as exc:
+            asyncio.run(pq.enforce_mcp_proxy_preflight(_claims(), "wire-srv/mcp"))
+        assert exc.value.status_code == 503
+        assert exc.value.detail["error"] == "QUOTA_UNAVAILABLE"
+
+
+class TestRegisteredNameNormalizationEquivalence:
+    """The scope matcher's local mirror must derive the same registered name
+    as the /validate-side helper — the two hops must never disagree on the
+    key (an equivalence-test failure is a drift alarm, not a test bug)."""
+
+    @pytest.mark.parametrize(
+        "server_path",
+        [
+            "srv",
+            "srv/mcp",
+            "srv/sse",
+            "srv/messages",
+            "peer/srv",
+            "peer/srv/mcp",
+            "peer/srv/sse",
+            "peer/srv/messages",
+            "/srv/",
+            "//srv//mcp",
+            "",
+            "/",
+            "///",
+        ],
+    )
+    def test_local_mirror_matches_server_helper(self, server_path):
+        from auth_server.preflight_quota import _registered_server_from_proxy_name
+        from auth_server.server import _registered_server_from_proxy_path
+
+        assert _registered_server_from_proxy_name(server_path) == (
+            _registered_server_from_proxy_path(server_path)
+        )
+
+
+class TestQuotaGateScopeRoute:
+    """Route-level jurisdiction + refusal-audit finality
+    (fix-quota-gate-server-scope)."""
+
+    @staticmethod
+    def _headers(server: str) -> dict:
+        from auth_server.internal_request_token import mint_mcp_proxy_token
+
+        token = mint_mcp_proxy_token(
+            subject="alice",
+            scopes=["admin:all"],
+            server_name=server,
+            upstream_url="https://upstream.example/mcp",
+        )
+        return {"X-Internal-Token": token}
+
+    def _post(self, client, server: str):
+        return client.post(
+            f"/mcp-proxy/{server}",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers=self._headers(server),
+        )
+
+    def _fake_mcp_logger(self):
+        recorder = MagicMock()
+        recorder.log_mcp_access = AsyncMock()
+        return recorder, patch("auth_server.server.get_mcp_logger", return_value=recorder)
+
+    def test_out_of_scope_forwards_and_never_probes_wire(self, monkeypatch):
+        import auth_server.server as server_module
+        from fastapi.testclient import TestClient
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="wire-srv")
+        upstream = _build_mock_upstream_response(
+            200, {"content-type": "application/json"}, b'{"jsonrpc":"2.0","id":1,"result":{}}'
+        )
+        upstream_patch, upstream_client = _patch_upstream_client(upstream)
+        probe_client, probe_patch = _patch_probe_client(
+            _probe_response(200, {"code": 0, "data": {"balance": 100, "status": "active"}})
+        )
+        with (
+            probe_patch,
+            upstream_patch,
+            _patch_scope_repo_allow_all(),
+            patch.object(server_module, "_read_mcp_filter_enabled", return_value=False),
+        ):
+            client = TestClient(server_module.app)
+            response = self._post(client, "lex-srv")
+        assert response.status_code == 200
+        assert _probe_urls(probe_client) == [_SUB2API_USER_URL]
+        assert upstream_client.stream.called
+
+    def test_in_scope_refusal_writes_definitive_audit_record(self, monkeypatch):
+        """Scenario 6 (reinterpreted): a refused call must leave a refused
+        final-outcome record — status=refused, HTTP error code, machine code
+        in the message — alongside /validate's earlier success row."""
+        import auth_server.server as server_module
+        from fastapi.testclient import TestClient
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="wire-srv")
+        upstream_patch, upstream_client = _patch_upstream_client(
+            _build_mock_upstream_response()
+        )
+        probe_client, probe_patch = _patch_probe_client(
+            _probe_response(404, {"detail": "caller 56 未映射到客户"})
+        )
+        recorder, logger_patch = self._fake_mcp_logger()
+        with (
+            probe_patch,
+            upstream_patch,
+            logger_patch,
+            _patch_scope_repo_allow_all(),
+            patch.object(server_module, "_read_mcp_filter_enabled", return_value=False),
+        ):
+            client = TestClient(server_module.app)
+            response = self._post(client, "wire-srv/mcp")
+        assert response.status_code == 503
+        assert response.json()["detail"]["error"] == "QUOTA_UNAVAILABLE"
+        # The refused call never reaches the upstream.
+        assert not upstream_client.stream.called
+        assert _probe_urls(probe_client) == [_WIRE_QUOTA_URL]
+        # The definitive record exists and says refused.
+        recorder.log_mcp_access.assert_awaited_once()
+        kwargs = recorder.log_mcp_access.await_args.kwargs
+        assert kwargs["response_status"] == "refused"
+        assert kwargs["error_code"] == 503
+        assert "QUOTA_UNAVAILABLE" in (kwargs["error_message"] or "")
+        assert kwargs["mcp_server"].name == "wire-srv/mcp"
+        assert kwargs["identity"].username == "alice"
+
+    def test_allowed_traffic_writes_no_refusal_record(self, monkeypatch):
+        import auth_server.server as server_module
+        from fastapi.testclient import TestClient
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="wire-srv")
+        upstream = _build_mock_upstream_response(
+            200, {"content-type": "application/json"}, b'{"jsonrpc":"2.0","id":1,"result":{}}'
+        )
+        upstream_patch, _upstream_client = _patch_upstream_client(upstream)
+        # Free-tier semantics (enforce_balance=false): the line gate passes and
+        # skips the balance probe, so the wire URL is the ONLY probe on the
+        # allowed path.
+        probe_client, probe_patch = _patch_probe_client(
+            _quota_response(100, enforce_balance=False)
+        )
+        recorder, logger_patch = self._fake_mcp_logger()
+        with (
+            probe_patch,
+            upstream_patch,
+            logger_patch,
+            _patch_scope_repo_allow_all(),
+            patch.object(server_module, "_read_mcp_filter_enabled", return_value=False),
+        ):
+            client = TestClient(server_module.app)
+            response = self._post(client, "wire-srv/mcp")
+        assert response.status_code == 200
+        assert recorder.log_mcp_access.await_count == 0
+        assert _probe_urls(probe_client) == [_WIRE_QUOTA_URL]
+
+    def test_audit_logger_failure_never_masks_the_refusal(self, monkeypatch):
+        """The audit write is best-effort: a broken logger must not turn a
+        503 refusal into a 500."""
+        import auth_server.server as server_module
+        from fastapi.testclient import TestClient
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="wire-srv")
+        upstream_patch, _upstream_client = _patch_upstream_client(
+            _build_mock_upstream_response()
+        )
+        probe_client, probe_patch = _patch_probe_client(_probe_response(404, {"detail": "x"}))
+        broken = MagicMock()
+        broken.log_mcp_access = AsyncMock(side_effect=RuntimeError("audit plane down"))
+        with (
+            probe_patch,
+            upstream_patch,
+            patch("auth_server.server.get_mcp_logger", return_value=broken),
+            _patch_scope_repo_allow_all(),
+            patch.object(server_module, "_read_mcp_filter_enabled", return_value=False),
+        ):
+            client = TestClient(server_module.app)
+            response = self._post(client, "wire-srv/mcp")
+        assert response.status_code == 503
+        assert response.json()["detail"]["error"] == "QUOTA_UNAVAILABLE"
+
+    def test_balance_refusal_on_exempt_server_also_audited(self, monkeypatch):
+        """The refusal-audit wrapper covers the preflight's balance verdicts
+        too (402 INSUFFICIENT_BALANCE on an exempt server)."""
+        import auth_server.server as server_module
+        from fastapi.testclient import TestClient
+
+        _gate_env(monkeypatch, FD_WIRE_QUOTA_SERVERS="wire-srv")
+        upstream_patch, upstream_client = _patch_upstream_client(
+            _build_mock_upstream_response()
+        )
+        probe_client, probe_patch = _patch_probe_client(
+            _probe_response(200, {"code": 0, "data": {"balance": 0, "status": "active"}})
+        )
+        recorder, logger_patch = self._fake_mcp_logger()
+        with (
+            probe_patch,
+            upstream_patch,
+            logger_patch,
+            _patch_scope_repo_allow_all(),
+            patch.object(server_module, "_read_mcp_filter_enabled", return_value=False),
+        ):
+            client = TestClient(server_module.app)
+            response = self._post(client, "lex-srv")
+        assert response.status_code == 402
+        assert not upstream_client.stream.called
+        recorder.log_mcp_access.assert_awaited_once()
+        kwargs = recorder.log_mcp_access.await_args.kwargs
+        assert kwargs["response_status"] == "refused"
+        assert kwargs["error_code"] == 402
+        assert "INSUFFICIENT_BALANCE" in (kwargs["error_message"] or "")

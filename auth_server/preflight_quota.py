@@ -277,6 +277,64 @@ def _quota_gate_enabled() -> bool:
     return _env_truthy(os.getenv("FD_WIRE_QUOTA_GATE"), default=False)
 
 
+#: Trailing MCP transport endpoint segments stripped when deriving the
+#: registered server name from a proxy path. Mirrors
+#: ``server.py::MCP_TRANSPORT_ENDPOINTS`` (tests pin the equivalence).
+_TRANSPORT_ENDPOINTS: frozenset[str] = frozenset({"mcp", "sse", "messages"})
+
+
+def _registered_server_from_proxy_name(server_path: str) -> str:
+    """Normalize a proxy-path server segment to the registered server name.
+
+    Local mirror of ``server.py::_registered_server_from_proxy_path`` (not
+    imported — server.py lazily imports this module, and a top-level reverse
+    import would be fragile): strip a single trailing MCP transport segment,
+    preserve everything else so federated ``peer/server`` keys stay intact.
+    A drift between the two shows up as an equivalence-test failure, never
+    as a silent authorization/scope skew between the hops.
+    """
+    parts = [p for p in (server_path or "").strip("/").split("/") if p]
+    if len(parts) >= 2 and parts[-1] in _TRANSPORT_ENDPOINTS:
+        parts = parts[:-1]
+    return "/".join(parts)
+
+
+def _quota_scope_servers() -> frozenset[str] | None:
+    """Wire line-quota gate jurisdiction (fix-quota-gate-server-scope).
+
+    ``FD_WIRE_QUOTA_SERVERS`` is the opt-in registered-server list:
+    unset -> ``None`` (the gate polices every server — the pre-scope
+    behavior, kept for gray-release safety and because a wire free tier's
+    ``enforce_balance=false`` semantics arrive from the wire quota response
+    itself); set -> only the listed servers are gated. The opt-in polarity is
+    the root fix: any future line's servers are structurally exempt, so the
+    lex incident (a non-wire customer 404ing the wire quota plane and being
+    fail-closed) cannot recur for a new line.
+    """
+    raw = os.getenv("FD_WIRE_QUOTA_SERVERS")
+    if raw is None or not raw.strip():
+        return None
+    return frozenset(
+        _registered_server_from_proxy_name(entry).lower()
+        for entry in raw.split(",")
+        if entry.strip()
+    )
+
+
+def _server_in_gate_scope(server_name: str) -> bool:
+    """True when the line-quota gate's jurisdiction covers this server."""
+    scope = _quota_scope_servers()
+    if scope is None:
+        return True
+    registered = _registered_server_from_proxy_name(server_name or "")
+    if not registered:
+        # Slashes-only path: no nginx location renders for it, unreachable
+        # in practice; treat as out of jurisdiction rather than gating a
+        # name that can never be listed.
+        return False
+    return registered.lower() in scope
+
+
 def _quota_base() -> str:
     return (os.getenv("FD_WIRE_QUOTA_URL") or "").strip().rstrip("/")
 
@@ -892,8 +950,20 @@ async def enforce_mcp_proxy_preflight(
     # credentials meter to the platform track). The response's
     # enforce_balance flag conditions the balance gate below: false skips it
     # entirely so a free-tier 0 balance is never the thing that refuses.
+    # fix-quota-gate-server-scope: the gate additionally requires
+    # _server_in_gate_scope — it polices the wire line's servers ONLY. The
+    # caller map is shared across lines (wire and lex customers live in one
+    # SUB2API_CALLER_MAP), so a non-wire caller on a non-wire server must not
+    # be probed against the wire quota plane (their 404 "no such customer"
+    # is the other line's normal state, not a fail-closable misconfiguration).
+    # The balance gate below is deliberately OUTSIDE this scope condition:
+    # an exempted caller keeps the ordinary balance semantics.
     skip_balance_gate = False
-    if _quota_gate_enabled() and not _is_admin_caller(claims):
+    if (
+        _quota_gate_enabled()
+        and not _is_admin_caller(claims)
+        and _server_in_gate_scope(server_name)
+    ):
         # The wire quota endpoint is keyed by sub2api USER id (what the
         # onboarding-written caller map stores). A key-shaped map value
         # (legacy env override layer) cannot identify a quota account:
